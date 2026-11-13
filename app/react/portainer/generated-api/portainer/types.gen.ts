@@ -15072,6 +15072,10 @@ export type EndpointGroupUpdateErrors = {
    */
   400: unknown;
   /**
+   * Renaming the default 'Unassigned' group is not allowed
+   */
+  403: unknown;
+  /**
    * EndpointGroup not found
    */
   404: unknown;
@@ -16648,7 +16652,7 @@ export type GitOpsSourcesUpdateAccessResponse =
 
 export type GitOpsSourcesTestByIdData = {
   /**
-   * Optional connection overrides; omitted fields fall back to stored values
+   * Optional changes to the stored settings, used only for this test. A field that is not sent keeps its stored value. Fields other than name and interval need write access to the source
    */
   body?: SourcesGitSourceUpdatePayload;
   path: {
@@ -16667,7 +16671,7 @@ export type GitOpsSourcesTestByIdErrors = {
    */
   400: unknown;
   /**
-   * Access denied
+   * Access denied, or the request changes settings and the user has no write access to the source
    */
   403: unknown;
   /**
@@ -22865,11 +22869,11 @@ export type StackUpdateData = {
      */
     id: number;
   };
-  query: {
+  query?: {
     /**
-     * Environment identifier
+     * Environment(endpoint) identifier the stack belongs to. It can only be used by an administrator to bind a legacy stack that has no environment recorded.
      */
-    endpointId: number;
+    endpointId?: number;
   };
   url: '/stacks/{id}';
 };
@@ -23019,7 +23023,7 @@ export type StackUpdateGitData = {
   };
   query?: {
     /**
-     * Stacks created before version 1.18.0 might not have an associated environment(endpoint) identifier. Use this optional parameter to set the environment(endpoint) identifier used by the stack.
+     * Environment(Endpoint) identifier the stack belongs to. It can only be used by an administrator to bind a legacy stack that has no environment recorded.
      */
     endpointId?: number;
   };
@@ -23068,7 +23072,7 @@ export type StackGitRedeployData = {
   };
   query?: {
     /**
-     * Stacks created before version 1.18.0 might not have an associated environment(endpoint) identifier. Use this optional parameter to set the environment(endpoint) identifier used by the stack.
+     * Environment(Endpoint) identifier the stack belongs to. It can only be used by an administrator to bind a legacy stack that has no environment recorded.
      */
     endpointId?: number;
   };
@@ -24569,6 +24573,10 @@ export type UserDeleteErrors = {
    */
   404: unknown;
   /**
+   * User is the last administrator
+   */
+  409: unknown;
+  /**
    * Server error
    */
   500: unknown;
@@ -24653,7 +24661,7 @@ export type UserUpdateErrors = {
    */
   404: unknown;
   /**
-   * Username already exist
+   * Username already exist or the user is the last administrator
    */
   409: unknown;
   /**
