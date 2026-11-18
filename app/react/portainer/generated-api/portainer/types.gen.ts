@@ -15700,7 +15700,7 @@ export type EndpointForceUpdateServiceErrors = {
    */
   403: unknown;
   /**
-   * endpoint not found
+   * endpoint not found, or service not found or not accessible
    */
   404: unknown;
   /**
@@ -23175,7 +23175,7 @@ export type StackStartData = {
   };
   query: {
     /**
-     * Environment identifier
+     * Environment(Endpoint) identifier the stack belongs to
      */
     endpointId: number;
   };
@@ -23224,7 +23224,7 @@ export type StackStopData = {
   };
   query: {
     /**
-     * Environment identifier
+     * Environment(Endpoint) identifier the stack belongs to
      */
     endpointId: number;
   };
@@ -25389,6 +25389,14 @@ export type GetWebsocketExecErrors = {
    * Bad Request
    */
   400: unknown;
+  /**
+   * Forbidden
+   */
+  403: unknown;
+  /**
+   * Not Found
+   */
+  404: unknown;
   /**
    * Conflict
    */

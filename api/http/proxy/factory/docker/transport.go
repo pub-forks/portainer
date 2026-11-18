@@ -264,8 +264,8 @@ func (transport *Transport) proxyConfigRequest(request *http.Request, unversione
 		return transport.rewriteOperation(request, transport.configListOperation)
 
 	default:
-		// Assume /configs/{id}
-		configID := path.Base(requestPath)
+		// Assume /configs/{id} or /configs/{id}/update
+		configID, _, _ := strings.Cut(strings.TrimPrefix(requestPath, "/configs/"), "/")
 
 		switch request.Method {
 		case http.MethodGet:
@@ -292,55 +292,88 @@ func (transport *Transport) proxyContainerRequest(request *http.Request, unversi
 		return transport.rewriteOperationWithLabelFiltering(request, transport.containerListOperation)
 
 	default:
-		// This section assumes /containers/**
-		if match, _ := path.Match("/containers/*/*", requestPath); match {
-			// Handle /containers/{id}/{action} requests
-			containerID := path.Base(path.Dir(requestPath))
-			action := path.Base(requestPath)
+		// This section assumes /containers/{id} or /containers/{id}/{action}, where {id} may contain slashes
+		containerPath, ok := strings.CutPrefix(requestPath, "/containers/")
+		if !ok {
+			return transport.executeDockerRequest(request)
+		}
 
-			if action == "json" {
-				return transport.rewriteOperation(request, transport.containerInspectOperation)
-			}
+		if request.Method == http.MethodDelete {
+			return transport.executeGenericResourceDeletionOperation(request, containerPath, containerPath, portainer.ContainerResourceControl)
+		}
 
-			if action == "update" {
-				return transport.decorateContainerUpdateOperation(request, containerID)
-			}
-
-			return transport.restrictedResourceOperation(request, containerID, containerID, portainer.ContainerResourceControl, false)
-		} else if match, _ := path.Match("/containers/*", requestPath); match {
-			// Handle /containers/{id} requests
-			containerID := path.Base(requestPath)
-
-			if request.Method == http.MethodDelete {
-				return transport.executeGenericResourceDeletionOperation(request, containerID, containerID, portainer.ContainerResourceControl)
-			}
-
-			return transport.restrictedResourceOperation(request, containerID, containerID, portainer.ContainerResourceControl, false)
-		} else if match, _ := path.Match("/containers/*/attach/ws", requestPath); match {
-			containerID := path.Base(path.Dir(path.Dir(requestPath)))
-
+		if containerID, ok := strings.CutSuffix(containerPath, "/attach/ws"); ok {
 			return transport.restrictedResourceOperation(request, containerID, containerID, portainer.ContainerResourceControl, false)
 		}
 
-		return transport.executeDockerRequest(request)
+		containerID, action := containerPath, ""
+		if i := strings.LastIndex(containerPath, "/"); i >= 0 {
+			containerID, action = containerPath[:i], containerPath[i+1:]
+		}
+
+		switch action {
+		case "json":
+			return transport.rewriteOperation(request, transport.containerInspectOperation)
+		case "update":
+			return transport.decorateContainerUpdateOperation(request, containerID)
+		}
+
+		return transport.restrictedResourceOperation(request, containerID, containerID, portainer.ContainerResourceControl, false)
 	}
 }
 
 func (transport *Transport) proxyExecRequest(request *http.Request, unversionedPath string) (*http.Response, error) {
 	execID := path.Base(path.Dir(unversionedPath))
 
-	client, err := transport.dockerClientFactory.CreateClient(transport.endpoint, request.Header.Get(portainer.PortainerAgentTargetHeader), nil)
+	canAccess, err := transport.CanAccessExecContainer(request, request.Header.Get(portainer.PortainerAgentTargetHeader), execID)
 	if err != nil {
 		return nil, err
+	}
+
+	if !canAccess {
+		return utils.WriteAccessDeniedResponse()
+	}
+
+	return transport.executeDockerRequest(request)
+}
+
+// CanAccessExecContainer reports whether the user that issued the request can access the container
+// that owns the given exec instance
+func (transport *Transport) CanAccessExecContainer(request *http.Request, nodeName string, execID string) (bool, error) {
+	client, err := transport.dockerClientFactory.CreateClient(transport.endpoint, nodeName, nil)
+	if err != nil {
+		return false, err
 	}
 	defer logs.CloseAndLogErr(client)
 
 	execInspect, err := client.ContainerExecInspect(request.Context(), execID)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 
-	return transport.restrictedResourceOperation(request, execInspect.ContainerID, execInspect.ContainerID, portainer.ContainerResourceControl, false)
+	return transport.canAccessResource(request, nodeName, execInspect.ContainerID, execInspect.ContainerID, portainer.ContainerResourceControl, false)
+}
+
+// ResolveAccessibleContainerID resolves the given container reference to its full ID when the user
+// that issued the request can access that container, and returns an empty ID otherwise
+func (transport *Transport) ResolveAccessibleContainerID(request *http.Request, nodeName string, containerID string) (string, error) {
+	client, err := transport.dockerClientFactory.CreateClient(transport.endpoint, nodeName, nil)
+	if err != nil {
+		return "", err
+	}
+	defer logs.CloseAndLogErr(client)
+
+	container, err := client.ContainerInspect(request.Context(), containerID)
+	if err != nil {
+		return "", err
+	}
+
+	canAccess, err := transport.canAccessResource(request, nodeName, container.ID, container.ID, portainer.ContainerResourceControl, false)
+	if err != nil || !canAccess {
+		return "", err
+	}
+
+	return container.ID, nil
 }
 
 func (transport *Transport) proxyServiceRequest(request *http.Request, unversionedPath string) (*http.Response, error) {
@@ -406,37 +439,37 @@ func (transport *Transport) proxyVolumeRequest(request *http.Request, unversione
 	}
 }
 
-func match(requestPath string, pattern string) bool {
-	ok, err := path.Match(pattern, requestPath)
-	return err == nil && ok
-}
-
 func (transport *Transport) proxyNetworkRequest(request *http.Request, unversionedPath string) (*http.Response, error) {
 	requestPath := unversionedPath
 
-	switch {
-	case requestPath == "/networks/create":
+	switch requestPath {
+	case "/networks/create":
 		return transport.decorateGenericResourceCreationOperation(request, networkObjectIdentifier, portainer.NetworkResourceControl)
 
-	case requestPath == "/networks":
+	case "/networks":
 		return transport.rewriteOperation(request, transport.networkListOperation)
+	}
 
-	case request.Method == http.MethodPost && match(requestPath, "/networks/*/connect"),
-		request.Method == http.MethodPost && match(requestPath, "/networks/*/disconnect"):
+	// Assume /networks/{id} or /networks/{id}/{action}, where {id} may contain slashes
+	networkID := strings.TrimPrefix(requestPath, "/networks/")
 
-		networkID := path.Base(path.Dir(requestPath))
-		return transport.networkConnectionOperation(request, networkID)
+	switch request.Method {
+	case http.MethodPost:
+		if id, ok := strings.CutSuffix(networkID, "/connect"); ok {
+			return transport.networkConnectionOperation(request, id)
+		}
 
-	case request.Method == http.MethodGet && match(requestPath, "/networks/*"):
+		if id, ok := strings.CutSuffix(networkID, "/disconnect"); ok {
+			return transport.networkConnectionOperation(request, id)
+		}
+
+	case http.MethodGet:
 		return transport.rewriteOperation(request, transport.networkInspectOperation)
 
-	case request.Method == http.MethodDelete && match(requestPath, "/networks/*"):
-		networkID := path.Base(requestPath)
+	case http.MethodDelete:
 		return transport.executeGenericResourceDeletionOperation(request, networkID, networkID, portainer.NetworkResourceControl)
 	}
 
-	// Assume /networks/{id}
-	networkID := path.Base(requestPath)
 	return transport.restrictedResourceOperation(request, networkID, networkID, portainer.NetworkResourceControl, false)
 }
 
@@ -451,8 +484,8 @@ func (transport *Transport) proxySecretRequest(request *http.Request, unversione
 		return transport.rewriteOperation(request, transport.secretListOperation)
 
 	default:
-		// Assume /secrets/{id}
-		secretID := path.Base(requestPath)
+		// Assume /secrets/{id} or /secrets/{id}/update
+		secretID, _, _ := strings.Cut(strings.TrimPrefix(requestPath, "/secrets/"), "/")
 
 		switch request.Method {
 		case http.MethodGet:
@@ -657,43 +690,7 @@ func (transport *Transport) decorateRegistryAuthenticationHeader(request *http.R
 }
 
 func (transport *Transport) restrictedResourceOperation(request *http.Request, resourceID string, dockerResourceID string, resourceType portainer.ResourceControlType, volumeBrowseRestrictionCheck bool) (*http.Response, error) {
-	tokenData, err := security.RetrieveTokenData(request)
-	if err != nil {
-		return nil, err
-	}
-
-	if tokenData.Role == portainer.AdministratorRole {
-		return transport.executeDockerRequest(request)
-	}
-
-	if volumeBrowseRestrictionCheck {
-		securitySettings, err := transport.fetchEndpointSecuritySettings()
-		if err != nil {
-			return nil, err
-		}
-
-		if !securitySettings.AllowVolumeBrowserForRegularUsers {
-			return utils.WriteAccessDeniedResponse()
-		}
-	}
-
-	teamMemberships, err := transport.dataStore.TeamMembership().TeamMembershipsByUserID(tokenData.ID)
-	if err != nil {
-		return nil, err
-	}
-
-	userTeamIDs := authorization.TeamIDs(teamMemberships)
-
-	resourceControls, err := transport.dataStore.ResourceControl().ReadAll()
-	if err != nil {
-		return nil, err
-	}
-
-	getClient := func() (*dockerclient.Client, error) {
-		return transport.dockerClientFactory.CreateClient(transport.endpoint, request.Header.Get(portainer.PortainerAgentTargetHeader), nil)
-	}
-
-	canAccess, err := transport.userCanAccessResource(tokenData.ID, userTeamIDs, resourceControls, getClient, resourceID, dockerResourceID, resourceType)
+	canAccess, err := transport.canAccessResource(request, request.Header.Get(portainer.PortainerAgentTargetHeader), resourceID, dockerResourceID, resourceType, volumeBrowseRestrictionCheck)
 	if err != nil {
 		return nil, err
 	}
@@ -703,6 +700,46 @@ func (transport *Transport) restrictedResourceOperation(request *http.Request, r
 	}
 
 	return transport.executeDockerRequest(request)
+}
+
+func (transport *Transport) canAccessResource(request *http.Request, nodeName string, resourceID string, dockerResourceID string, resourceType portainer.ResourceControlType, volumeBrowseRestrictionCheck bool) (bool, error) {
+	tokenData, err := security.RetrieveTokenData(request)
+	if err != nil {
+		return false, err
+	}
+
+	if tokenData.Role == portainer.AdministratorRole {
+		return true, nil
+	}
+
+	if volumeBrowseRestrictionCheck {
+		securitySettings, err := transport.fetchEndpointSecuritySettings()
+		if err != nil {
+			return false, err
+		}
+
+		if !securitySettings.AllowVolumeBrowserForRegularUsers {
+			return false, nil
+		}
+	}
+
+	teamMemberships, err := transport.dataStore.TeamMembership().TeamMembershipsByUserID(tokenData.ID)
+	if err != nil {
+		return false, err
+	}
+
+	userTeamIDs := authorization.TeamIDs(teamMemberships)
+
+	resourceControls, err := transport.dataStore.ResourceControl().ReadAll()
+	if err != nil {
+		return false, err
+	}
+
+	getClient := func() (*dockerclient.Client, error) {
+		return transport.dockerClientFactory.CreateClient(transport.endpoint, nodeName, nil)
+	}
+
+	return transport.userCanAccessResource(tokenData.ID, userTeamIDs, resourceControls, getClient, resourceID, dockerResourceID, resourceType)
 }
 
 func (transport *Transport) userCanAccessResources(userID portainer.UserID, resourceIDs []string, resourceType portainer.ResourceControlType, getClient func() (*dockerclient.Client, error)) (bool, error) {
